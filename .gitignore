@@ -8,3 +8,18 @@ wheels/
 
 # Virtual environments
 .venv
+.env
+
+# Local documents and runtime state
+documents/*
+!documents/.gitkeep
+*.db
+*.db-shm
+*.db-wal
+
+# Generated RAG artifacts
+faiss_index/
+faiss_index_vision/
+faiss_index_documents/
+faiss_index_documents_vision/
+vision_cache.json
