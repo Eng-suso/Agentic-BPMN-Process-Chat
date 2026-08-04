@@ -222,3 +222,7 @@ Only `documents/.gitkeep` is intended to be tracked.
 The assistant is not a BPMN execution engine. It is a process-analysis and
 modeling assistant: it retrieves evidence, proposes BPMN structures, highlights
 ambiguities, and asks follow-up questions when process details are missing.
+
+## License
+
+MIT License. See [LICENSE](LICENSE).
