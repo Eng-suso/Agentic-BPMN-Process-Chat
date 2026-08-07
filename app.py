@@ -8,6 +8,7 @@ from settings import DOCUMENTS_FOLDER, MODEL_NAME, SUPPORTED_IMAGE_EXTENSIONS
 import streamlit as st
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
+from langgraph.types import Command
 from openai import LengthFinishReasonError
 
 st.set_page_config(page_title="Agentic BPMN RAG", page_icon=":speech_balloon:")
@@ -33,6 +34,7 @@ def new_thread():
         "title": "",
         "title_generated": False,
         "has_user_message": False,
+        "pending_interrupt": None,
         "messages": [],
     }
 
@@ -82,6 +84,7 @@ def normalize_threads():
         thread.setdefault("title_generated", bool(thread["title"]))
         thread.setdefault("messages", [])
         thread.setdefault("has_user_message", has_user_message(thread["messages"]))
+        thread.setdefault("pending_interrupt", None)
 
 
 def title_messages(messages_history):
@@ -113,13 +116,52 @@ def thread_label(thread_id):
     return thread["title"] or "Untitled conversation"
 
 
-def stream_assistant_response(user_input, config):
+def interrupt_value(interrupt):
+    return getattr(interrupt, "value", interrupt)
+
+
+def interrupt_question(interrupt):
+    value = interrupt_value(interrupt)
+
+    if isinstance(value, dict):
+        return value.get("question") or "Mi serve un chiarimento prima di procedere."
+
+    return str(value)
+
+
+def response_interrupts(response):
+    if isinstance(response, dict):
+        return response.get("__interrupt__", ())
+
+    return ()
+
+
+def stream_assistant_response(user_input, config, resume=False):
     try:
-        for message_chunk, metadata in chatbot.stream(
-            {"messages": [HumanMessage(content=user_input)]},
+        graph_input = Command(resume=user_input) if resume else {"messages": [HumanMessage(content=user_input)]}
+        streamed_content = False
+
+        for stream_mode, chunk in chatbot.stream(
+            graph_input,
             config=config,
-            stream_mode="messages",
+            stream_mode=["messages", "updates"],
         ):
+            if stream_mode == "updates":
+                interrupts = response_interrupts(chunk)
+
+                if interrupts:
+                    interrupt = interrupts[0]
+                    active_thread()["pending_interrupt"] = interrupt_value(interrupt)
+                    yield interrupt_question(interrupt)
+                    return
+
+                continue
+
+            if stream_mode != "messages":
+                continue
+
+            message_chunk, metadata = chunk
+
             if metadata.get("langgraph_node") != "answer":
                 continue
 
@@ -129,12 +171,34 @@ def stream_assistant_response(user_input, config):
             content = message_chunk.content
 
             if isinstance(content, str) and content:
+                streamed_content = True
                 yield content
+
+        active_thread()["pending_interrupt"] = None
+
+        if not streamed_content:
+            response = chatbot.get_state(config=thread_config(st.session_state["thread_id"]))
+            interrupts = getattr(response, "interrupts", ())
+
+            if interrupts:
+                interrupt = interrupts[0]
+                active_thread()["pending_interrupt"] = interrupt_value(interrupt)
+                yield interrupt_question(interrupt)
     except LengthFinishReasonError:
-        response = chatbot.invoke({"messages": [HumanMessage(content=user_input)]}, config=config)
+        graph_input = Command(resume=user_input) if resume else {"messages": [HumanMessage(content=user_input)]}
+        response = chatbot.invoke(graph_input, config=config)
+        interrupts = response_interrupts(response)
+
+        if interrupts:
+            interrupt = interrupts[0]
+            active_thread()["pending_interrupt"] = interrupt_value(interrupt)
+            yield interrupt_question(interrupt)
+            return
+
         message = response["messages"][-1]
 
         if isinstance(message, AIMessage) and isinstance(message.content, str):
+            active_thread()["pending_interrupt"] = None
             yield message.content
         else:
             yield "La risposta e' stata interrotta per limite di lunghezza. Prova con una richiesta piu' specifica."
@@ -275,9 +339,14 @@ for message in active_thread()["messages"]:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
+pending_interrupt = active_thread().get("pending_interrupt")
+
+if pending_interrupt:
+    st.button("In attesa di chiarimento", disabled=True)
+
 chat_input = st.chat_input(
-    placeholder="Type your message here...",
-    accept_file="multiple",
+    placeholder="Rispondi al chiarimento..." if pending_interrupt else "Type your message here...",
+    accept_file=False if pending_interrupt else "multiple",
     file_type=["pdf", "png", "jpg", "jpeg"],
 )
 
@@ -299,7 +368,8 @@ if chat_input:
         with st.chat_message("user"):
             st.markdown(user_input)
 
-    uploaded_file_names = save_uploaded_documents(uploaded_files)
+    is_resume = bool(thread.get("pending_interrupt"))
+    uploaded_file_names = [] if is_resume else save_uploaded_documents(uploaded_files)
 
     if uploaded_file_names:
         with st.spinner("Updating RAG index..."):
@@ -326,7 +396,7 @@ if chat_input:
     }
 
     with st.chat_message("assistant"):
-        ai_message = st.write_stream(stream_assistant_response(user_input, config))
+        ai_message = st.write_stream(stream_assistant_response(user_input, config, resume=is_resume))
 
         if not ai_message:
             ai_message = latest_assistant_content(st.session_state["thread_id"])

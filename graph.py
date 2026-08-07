@@ -6,6 +6,7 @@ from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
+from langgraph.types import interrupt
 from openai import LengthFinishReasonError
 from pydantic import BaseModel, Field
 
@@ -45,6 +46,14 @@ class RouteDecision(BaseModel):
         description="The rewritten query to send to the selected tool, or the original user request."
     )
     reason: str = Field(default="", description="Very short reason.")
+    needs_human: bool = Field(
+        default=False,
+        description="Whether the workflow needs human clarification before continuing."
+    )
+    human_question: str = Field(
+        default="",
+        description="The concise clarification question to ask the user when needs_human is true."
+    )
 
 
 class ChatState(TypedDict, total=False):
@@ -54,6 +63,9 @@ class ChatState(TypedDict, total=False):
     route: str
     route_query: str
     route_reason: str
+    needs_human: bool
+    human_question: str
+    human_clarification: str
 
 
 SYSTEM_PROMPT = """You are an expert BPMN 2.0 process modeling assistant.
@@ -112,6 +124,16 @@ Return one route:
 - direct: simple stable general question.
 - clarify: process mapping request is too vague and cannot be grounded in available local resources or prior conversation.
 
+Set needs_human=true only when a missing human decision changes the workflow materially.
+Good cases for needs_human:
+- The user asks to create, update, save, or generalize company-brain knowledge, but the scope is ambiguous.
+- It is unclear whether knowledge is client-specific, internal methodology, offer content, strategic decision, or temporary note.
+- The request would require strong assumptions about process scope, roles, trigger, output, or constraints.
+- Local sources appear insufficient or conflicting for a persistent/company-brain conclusion.
+
+Do not set needs_human for ordinary summaries, definitions, document lookup, simple drafts, or stable direct questions.
+When needs_human=true, provide one concise human_question in the user's language.
+
 If the user refers to an uploaded file, local document, diagram, image, example, or previous object using pronouns like "it/this/lo/quello", route to rag when local resources or prior context are available.
 If local resources are indexed and the user is asking to map, understand, improve, or explain a business process, route to rag before asking clarifying questions.
 Use clarify only when retrieval would not add useful context.
@@ -148,17 +170,27 @@ def router_node(state: ChatState):
         "route": decision.route,
         "route_query": decision.query or latest_text,
         "route_reason": decision.reason,
+        "needs_human": decision.needs_human,
+        "human_question": decision.human_question,
     }
 
 
 def normalize_route_decision(decision: RouteDecision) -> RouteDecision:
     """Keep the LLM router agentic while preventing it from skipping local evidence."""
 
-    if decision.route == "clarify" and has_indexed_resources():
+    if decision.route == "clarify":
+        decision.needs_human = True
+
+        if not decision.human_question:
+            decision.human_question = "Mi serve un chiarimento prima di procedere: qual e' il contesto corretto della richiesta?"
+
+    if decision.route == "clarify" and has_indexed_resources() and not decision.needs_human:
         return RouteDecision(
             route="rag",
             query=decision.query,
             reason="clarify promoted to rag",
+            needs_human=decision.needs_human,
+            human_question=decision.human_question,
         )
 
     return decision
@@ -205,6 +237,30 @@ def web_call_node(state: ChatState):
             )
         ]
     }
+
+def clarification_node(state: ChatState):
+    user_request = latest_user_text(state["messages"])
+    question = state.get("human_question") or (
+        "Mi serve un chiarimento prima di procedere: qual e' il contesto corretto della richiesta?"
+    )
+
+    clarification = interrupt(
+        {
+            "type": "clarification",
+            "question": question,
+            "original_request": user_request,
+            "reason": state.get("route_reason", ""),
+        }
+    )
+
+    return {
+        "needs_human": False,
+        "human_clarification": str(clarification),
+        "messages": [
+            HumanMessage(content=f"Chiarimento umano: {clarification}")
+        ],
+    }
+
 
 
 def answer_node(state: ChatState):
@@ -263,6 +319,13 @@ def finish_reason(message: BaseMessage) -> str:
 
 
 def route_after_router(state: ChatState):
+    if state.get("needs_human"):
+        return "clarification"
+
+    return route_without_human(state)
+
+
+def route_without_human(state: ChatState):
     route = state.get("route", "direct")
 
     if route == "rag":
@@ -374,12 +437,23 @@ graph.add_node("tools", tool_node)
 graph.add_node("router", router_node)
 graph.add_node("rag_call", rag_call_node)
 graph.add_node("web_call", web_call_node)
+graph.add_node("clarification", clarification_node)
 graph.add_node("answer", answer_node)
 
 graph.add_edge(START, "router")
 graph.add_conditional_edges(
     "router",
     route_after_router,
+    {
+        "clarification": "clarification",
+        "rag_call": "rag_call",
+        "web_call": "web_call",
+        "answer": "answer",
+    },
+)
+graph.add_conditional_edges(
+    "clarification",
+    route_without_human,
     {
         "rag_call": "rag_call",
         "web_call": "web_call",
